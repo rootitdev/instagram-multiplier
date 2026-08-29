@@ -1,0 +1,264 @@
+#!/usr/bin/python3
+"""CLI: add/remove/list Instagram-multiplier users by panel username.
+
+Install: /usr/local/sbin/instagram-multiplier
+Looks up id in PasarGuard sqlite (docker pasarguard). Never prints secrets.
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "/root/vpn-infra/scripts")
+from instagram_multiplier import parse_user_ids, tag_for  # noqa: E402
+
+USERS_FILE = Path("/etc/vpn-monitor/instagram-multiplier-users.txt")
+EXPORT = Path("/root/vpn-infra/scripts/iran_sync_export.py")
+CONTAINER = "pasarguard"
+LOCK_FILE = USERS_FILE.parent / ".instagram-multiplier-users.lock"
+
+
+def fail(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def usage() -> None:
+    fail(
+        "usage:\n"
+        "  instagram-multiplier add <username>\n"
+        "  instagram-multiplier remove <username>\n"
+        "  instagram-multiplier list",
+        2,
+    )
+
+
+def docker_users(sql: str, args: list) -> list[dict]:
+    payload = json.dumps({"sql": sql, "args": args}, ensure_ascii=False)
+    py = r"""
+import json, sqlite3, sys
+req = json.loads(sys.stdin.read())
+c = sqlite3.connect("/code/db.sqlite3")
+rows = c.execute(req["sql"], req["args"]).fetchall()
+print(json.dumps([{"id": r[0], "username": r[1], "status": r[2]} for r in rows], ensure_ascii=False))
+"""
+    try:
+        p = subprocess.run(
+            ["docker", "exec", "-i", CONTAINER, "/code/.venv/bin/python", "-c", py],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        fail("docker در این سرور پیدا نشد.")
+    except subprocess.TimeoutExpired:
+        fail("خواندن دیتابیس پنل طولانی شد.")
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "").strip().splitlines()
+        tail = err[-1] if err else f"exit {p.returncode}"
+        fail(f"نتوانستم دیتابیس پنل را بخوانم ({CONTAINER}). {tail}")
+    try:
+        return json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        fail("جواب دیتابیس پنل قابل‌خواندن نبود.")
+
+
+def lookup(username: str) -> dict:
+    name = username.strip()
+    if not name or name.startswith("-"):
+        fail("نام کاربری نامعتبر است.")
+    rows = docker_users(
+        "select id, username, status from users where username = ? order by id",
+        [name],
+    )
+    if not rows:
+        rows = docker_users(
+            "select id, username, status from users where lower(username) = lower(?) order by id",
+            [name],
+        )
+    if not rows:
+        fail(f"کاربر «{name}» در پنل پیدا نشد.")
+    if len(rows) > 1:
+        lines = [f"چند کاربر با نام «{name}» پیدا شد؛ دقیق‌تر مشخص کنید:"]
+        for r in rows:
+            lines.append(f"  id={r['id']}  {r['username']}  status={r['status']}")
+        fail("\n".join(lines))
+    return rows[0]
+
+
+def names_by_id(ids: list[int]) -> dict[int, dict]:
+    if not ids:
+        return {}
+    q = ",".join("?" * len(ids))
+    rows = docker_users(
+        f"select id, username, status from users where id in ({q})",
+        [int(i) for i in ids],
+    )
+    return {int(r["id"]): r for r in rows}
+
+
+HEADER = (
+    "# Panel user ids that get Instagram billed at INSTAGRAM_MULTIPLIER.\n"
+    "# Everyone else is unchanged (no extra outbound/rule).\n"
+    "# One id per line. Comments allowed.\n"
+)
+
+
+def read_file() -> str:
+    if not USERS_FILE.exists():
+        return HEADER
+    return USERS_FILE.read_text()
+
+
+def write_file(text: str) -> None:
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = USERS_FILE.with_suffix(".txt.tmp")
+    tmp.write_text(text if text.endswith("\n") else text + "\n")
+    tmp.chmod(0o600)
+    tmp.replace(USERS_FILE)
+
+
+def entries_from_raw(raw: str) -> list[tuple[int, str]]:
+    """Keep only numeric ids; drop leftover prose that used to corrupt the file."""
+    seen: list[tuple[int, str]] = []
+    have: set[int] = set()
+    for ln in raw.splitlines():
+        s = ln.split("#", 1)
+        core = s[0].strip()
+        comment = s[1].strip() if len(s) > 1 else ""
+        tok = core.split()[0] if core else ""
+        if not tok.isdigit():
+            continue
+        uid = int(tok)
+        if uid in have:
+            continue
+        have.add(uid)
+        seen.append((uid, comment))
+    return seen
+
+
+def render_entries(entries: list[tuple[int, str]]) -> str:
+    lines = [HEADER.rstrip("\n")]
+    for uid, name in entries:
+        lines.append(f"{uid}  # {name}" if name else str(uid))
+    return "\n".join(lines) + "\n"
+
+
+def lock_users():
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(LOCK_FILE, "a+")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
+
+
+def current_ids(text: str | None = None) -> list[int]:
+    return parse_user_ids(text if text is not None else read_file())
+
+
+def add_id(uid: int, username: str) -> bool:
+    """Return True if the file changed. Always rewrites a clean id-only file."""
+    lock = lock_users()
+    try:
+        entries = entries_from_raw(read_file())
+        if uid in {e[0] for e in entries}:
+            write_file(render_entries(entries))
+            return False
+        entries.append((uid, username))
+        write_file(render_entries(entries))
+        return True
+    finally:
+        lock.close()
+
+
+def remove_id(uid: int) -> bool:
+    lock = lock_users()
+    try:
+        entries = entries_from_raw(read_file())
+        nxt = [e for e in entries if e[0] != uid]
+        if len(nxt) == len(entries):
+            write_file(render_entries(entries))
+            return False
+        write_file(render_entries(nxt))
+        return True
+    finally:
+        lock.close()
+
+
+def export_now() -> None:
+    print("در حال export به ایران…")
+    p = subprocess.run(
+        [sys.executable, str(EXPORT)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    out = (p.stdout or "").strip()
+    if out:
+        print(out.splitlines()[-1])
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "").strip().splitlines()
+        tail = err[-1] if err else f"exit {p.returncode}"
+        fail(f"export ناموفق بود: {tail}")
+
+
+def cmd_add(username: str) -> None:
+    u = lookup(username)
+    uid = int(u["id"])
+    if not add_id(uid, u["username"]):
+        print(f"«{u['username']}» از قبل در لیست است (id={uid}، {tag_for(uid)}).")
+        return
+    print(f"اضافه شد: {u['username']}  id={uid}  {tag_for(uid)}")
+    export_now()
+
+
+def cmd_remove(username: str) -> None:
+    u = lookup(username)
+    uid = int(u["id"])
+    if not remove_id(uid):
+        print(f"«{u['username']}» در لیست ضریب اینستاگرام نبود (id={uid}).")
+        return
+    print(f"حذف شد: {u['username']}  id={uid}")
+    export_now()
+
+
+def cmd_list() -> None:
+    ids = current_ids()
+    if not ids:
+        print("لیست خالی است.")
+        return
+    info = names_by_id(ids)
+    print(f"{'id':<6} {'username':<24} {'status':<10} tag")
+    for uid in ids:
+        r = info.get(uid)
+        if r:
+            print(f"{uid:<6} {r['username']:<24} {r['status']:<10} {tag_for(uid)}")
+        else:
+            print(f"{uid:<6} {'? (در پنل نیست)':<24} {'—':<10} {tag_for(uid)}")
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if not args:
+        usage()
+    cmd = args[0].lower()
+    if cmd in ("-h", "--help", "help"):
+        usage()
+    if cmd == "list":
+        if len(args) != 1:
+            usage()
+        cmd_list()
+        return
+    if cmd in ("add", "remove"):
+        if len(args) != 2:
+            usage()
+        (cmd_add if cmd == "add" else cmd_remove)(args[1])
+        return
+    usage()
+
+
+if __name__ == "__main__":
+    main()
