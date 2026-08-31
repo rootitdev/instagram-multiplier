@@ -13,9 +13,20 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, "/root/vpn-infra/scripts")
-from instagram_multiplier import parse_user_ids, tag_for  # noqa: E402
+from datetime import datetime, timedelta
+
+from instagram_multiplier import (  # noqa: E402
+    aggregate_ig_stats,
+    date_span,
+    format_bytes,
+    ig_extra_bytes,
+    load_settings,
+    parse_user_ids,
+    tag_for,
+)
 
 USERS_FILE = Path("/etc/vpn-monitor/instagram-multiplier-users.txt")
+STATS_LOG = Path("/var/log/vpn-path/stats.log")
 EXPORT = Path("/root/vpn-infra/scripts/iran_sync_export.py")
 CONTAINER = "pasarguard"
 LOCK_FILE = USERS_FILE.parent / ".instagram-multiplier-users.lock"
@@ -31,7 +42,8 @@ def usage() -> None:
         "usage:\n"
         "  instagram-multiplier add <username>\n"
         "  instagram-multiplier remove <username>\n"
-        "  instagram-multiplier list",
+        "  instagram-multiplier list\n"
+        "  instagram-multiplier stats [--date YYYY-MM-DD | --days N]",
         2,
     )
 
@@ -240,6 +252,83 @@ def cmd_list() -> None:
             print(f"{uid:<6} {'? (در پنل نیست)':<24} {'—':<10} {tag_for(uid)}")
 
 
+def _parse_stats_args(args: list[str]) -> tuple[set[str], str]:
+    if len(args) == 1:
+        today = datetime.now().date().isoformat()
+        return {today}, f"امروز ({today})"
+    if args[1] == "--date":
+        if len(args) != 3:
+            usage()
+        try:
+            datetime.strptime(args[2], "%Y-%m-%d")
+        except ValueError:
+            fail("تاریخ باید YYYY-MM-DD باشد.")
+        return {args[2]}, args[2]
+    if args[1] == "--days":
+        if len(args) != 3 or not args[2].isdigit() or int(args[2]) < 1:
+            usage()
+        n = int(args[2])
+        end = datetime.now().date()
+        dates = date_span(end, n)
+        label = f"{n} روز اخیر ({min(dates)} → {max(dates)})"
+        return dates, label
+    usage()
+    raise AssertionError
+
+
+def cmd_stats(args: list[str]) -> None:
+    dates, label = _parse_stats_args(args)
+    settings = load_settings()
+    ids = settings.user_ids
+    if not ids:
+        print("لیست کاربران ضریب خالی است.")
+        return
+    if not STATS_LOG.exists():
+        fail(f"لاگ آمار پیدا نشد: {STATS_LOG}")
+    agg = aggregate_ig_stats(STATS_LOG, ids, dates=dates)
+    info = names_by_id(ids)
+    mult = settings.multiplier
+    print(f"ضریب: {mult:g}×   بازه: {label}")
+    print(f"منبع: {STATS_LOG}")
+    print()
+    print(
+        f"{'id':<6} {'username':<22} {'ضریب‌شده':>12} {'اضافه ضریب':>14} "
+        f"{'کل شارژ':>12} {'کل واقعی':>12}"
+    )
+    tot_ig = tot_extra = tot_w = tot_raw = 0
+    active = 0
+    for uid in ids:
+        st = agg.get(uid)
+        ig = st.ig if st else 0
+        raw = st.raw if st else 0
+        weighted = st.weighted if st else 0
+        extra = ig_extra_bytes(ig, mult)
+        r = info.get(uid)
+        name = r["username"] if r else "? (در پنل نیست)"
+        if ig:
+            active += 1
+            tot_ig += ig
+            tot_extra += extra
+            tot_w += weighted
+            tot_raw += raw
+        print(
+            f"{uid:<6} {name:<22} {format_bytes(ig):>12} {format_bytes(extra):>14} "
+            f"{format_bytes(weighted):>12} {format_bytes(raw):>12}"
+        )
+    print("-" * 84)
+    print(
+        f"{'جمع':<6} {'':22} {format_bytes(tot_ig):>12} {format_bytes(tot_extra):>14} "
+        f"{format_bytes(tot_w):>12} {format_bytes(tot_raw):>12}"
+    )
+    idle = len(ids) - active
+    print()
+    print(
+        f"کاربران فعال: {active}/{len(ids)}"
+        + (f"  |  بدون ترافیک ضریب‌شده در این بازه: {idle}" if idle else "")
+    )
+    print("توضیح: «ضریب‌شده» = Instagram + pornhub/xnxx/xvideos. «اضافه ضریب» ≈ ضریب‌شده × (ضریب−۱).")
+
+
 def main() -> None:
     args = sys.argv[1:]
     if not args:
@@ -251,6 +340,11 @@ def main() -> None:
         if len(args) != 1:
             usage()
         cmd_list()
+        return
+    if cmd == "stats":
+        if len(args) not in (1, 3):
+            usage()
+        cmd_stats(args)
         return
     if cmd in ("add", "remove"):
         if len(args) != 2:

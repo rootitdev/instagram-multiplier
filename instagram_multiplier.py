@@ -18,6 +18,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 TAG_PREFIX = "CAT-instagram-u"
@@ -27,6 +28,16 @@ DEFAULT_DOMAINS = (
     "full:instagram.com",
     "domain:cdninstagram.com",
     "domain:ig.me",
+    # pornhub / xnxx / xvideos (+ main CDNs) — same multiplier as Instagram
+    "domain:pornhub.com",
+    "domain:phncdn.com",
+    "domain:pornhub.org",
+    "domain:pornhub.net",
+    "domain:xnxx.com",
+    "domain:xnxx.tv",
+    "domain:xnxx.es",
+    "domain:xvideos.com",
+    "domain:xvideos-cdn.com",
 )
 
 
@@ -185,6 +196,7 @@ def inject_into_core(cfg: dict, settings: Settings | None = None) -> int:
 
 
 def instagram_bytes(delta_map: dict[str, int], uid: int) -> int:
+    """Bytes on CAT-instagram-u<id> (Instagram + configured adult hosts)."""
     tag = tag_for(uid)
     n = 0
     for direction in ("uplink", "downlink"):
@@ -235,6 +247,88 @@ def weighted_user_deltas(delta_map: dict[str, int], settings: Settings | None = 
         if weighted:
             out[uid] = weighted
     return out
+
+
+STATS_EXTRA_RE = re.compile(r"u(\d+)_raw=(\d+)_(?:cat|ig)=(\d+)_w=(\d+)")
+DEFAULT_STATS_LOG = Path("/var/log/vpn-path/stats.log")
+
+
+@dataclass
+class UserIntervalStats:
+    raw: int = 0
+    ig: int = 0
+    weighted: int = 0
+
+    @property
+    def extra(self) -> int:
+        return max(0, self.weighted - self.raw)
+
+
+def format_bytes(n: int) -> str:
+    b = float(max(0, int(n)))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if b < 1024.0 or unit == "TiB":
+            if unit == "B":
+                return f"{int(b)} {unit}"
+            return f"{b:.1f} {unit}"
+        b /= 1024.0
+    return f"{b:.1f} TiB"
+
+
+def parse_stats_line_extra(line: str) -> dict[int, UserIntervalStats]:
+    out: dict[int, UserIntervalStats] = {}
+    for m in STATS_EXTRA_RE.finditer(line):
+        uid = int(m.group(1))
+        raw, ig, weighted = (int(m.group(i)) for i in (2, 3, 4))
+        st = out.setdefault(uid, UserIntervalStats())
+        st.raw += raw
+        st.ig += ig
+        st.weighted += weighted
+    return out
+
+
+def _line_in_dates(line: str, dates: set[str]) -> bool:
+    if not dates:
+        return True
+    if len(line) < 10:
+        return False
+    return line[:10] in dates
+
+
+def aggregate_ig_stats(
+    log_path: Path | str = DEFAULT_STATS_LOG,
+    user_ids: list[int] | None = None,
+    *,
+    dates: set[str] | None = None,
+) -> dict[int, UserIntervalStats]:
+    """Sum u<id>_raw/_ig/_w fields from iran-stats log lines."""
+    path = Path(log_path)
+    if not path.exists():
+        return {}
+    selected = set(user_ids or [])
+    out: dict[int, UserIntervalStats] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if dates and not _line_in_dates(line, dates):
+            continue
+        for uid, chunk in parse_stats_line_extra(line).items():
+            if selected and uid not in selected:
+                continue
+            st = out.setdefault(uid, UserIntervalStats())
+            st.raw += chunk.raw
+            st.ig += chunk.ig
+            st.weighted += chunk.weighted
+    return out
+
+
+def ig_extra_bytes(ig_bytes: int, multiplier: float) -> int:
+    if ig_bytes <= 0 or multiplier <= 1:
+        return 0
+    return int(round(ig_bytes * (multiplier - 1.0)))
+
+
+def date_span(end: date, days: int) -> set[str]:
+    n = max(1, int(days))
+    return {(end - timedelta(days=i)).isoformat() for i in range(n)}
 
 
 def _demo() -> None:
